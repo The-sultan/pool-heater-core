@@ -1,0 +1,31 @@
+{
+  "name": "pool-heater-core",
+  "version": "1.0.0",
+  "description": "Abstract decouple library for controling heat pumps with the CC120A-U6.3 board",
+  "keywords": [
+    "pool",
+    "heater",
+    "esp32",
+    "esp8266",
+    "rmt",
+    "hardware-agnostic"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/The-sultan/pool-heater-core.git"
+  },
+  "authors": [
+    {
+      "name": "The-sultan"
+    }
+  ],
+  "frameworks": "arduino",
+  "platforms": [
+    "espressif32",
+    "espressif8266"
+  ],
+  "build": {
+    "srcDir": "src",
+    "includeDir": "include"
+  }
+}
