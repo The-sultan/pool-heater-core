@@ -1,4 +1,4 @@
-This code abstracts how to read a propietary code from pool heat pumps with board CC120A-U6.3. 
+This code abstracts how to read a propietary protocol that connects pool heat pumps with board CC120A-U6.3 and their controller/screen. 
 The intended use of this library is as follows:
    1 - standalone embeded code running on an ESP8266 or a ESP32
    2 - the core of an ESPHome component
