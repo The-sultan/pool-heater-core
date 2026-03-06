@@ -35,6 +35,7 @@ class ESP8266HeaterDriver : public IHeaterHardware {
 private:
     uint8_t _rxPin;
     uint8_t _txPin;
+    bool _inverted;
 
     // RX Ring Buffer to store decoded frames
     uint8_t _frames[HEATER_RX_BUFFER_SIZE][HEATER_FRAME_SIZE];
@@ -62,7 +63,7 @@ private:
 
 public:
     // Constructor allows dynamic pin assignment (e.g., D7, D2)
-    ESP8266HeaterDriver(uint8_t rxPin, uint8_t txPin);
+    ESP8266HeaterDriver(uint8_t rxPin, uint8_t txPin, bool inverted = false);
     
     // Virtual destructor is mandatory when implementing interfaces
     virtual ~ESP8266HeaterDriver() = default;

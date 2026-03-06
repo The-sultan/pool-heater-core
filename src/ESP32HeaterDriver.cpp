@@ -2,14 +2,15 @@
 #if defined(ESP32) || defined(ARDUINO_ARCH_ESP32)
 
 #include "ESP32HeaterDriver.h"
+#include "MultiLogger.h" // Use our new global Log
 #include <cstring>
 
 // -----------------------------------------------------------------------------
 // Constructor & Initialization
 // -----------------------------------------------------------------------------
-ESP32HeaterDriver::ESP32HeaterDriver(uint8_t rxPin, uint8_t txPin, rmt_channel_t txChannel, rmt_channel_t rxChannel)
-    : _rxPin((gpio_num_t)rxPin), _txPin((gpio_num_t)txPin), _txChannel(txChannel), _rxChannel(rxChannel),
-      _rxPos(0), _txPos(0), _rxTaskHandle(NULL) {
+ESP32HeaterDriver::ESP32HeaterDriver(uint8_t rxPin, uint8_t txPin, bool inverted, rmt_channel_t txChannel, rmt_channel_t rxChannel)
+    : _rxPin((gpio_num_t)rxPin), _txPin((gpio_num_t)txPin), _inverted(inverted), 
+      _txChannel(txChannel), _rxChannel(rxChannel), _rxPos(0), _txPos(0), _rxTaskHandle(NULL) {
 }
 
 ESP32HeaterDriver::~ESP32HeaterDriver() {
@@ -21,30 +22,36 @@ ESP32HeaterDriver::~ESP32HeaterDriver() {
 }
 
 void ESP32HeaterDriver::begin() {
+    // Determine the high/low levels based on hardware inversion
+    // If inverted (DIY transistors), a High from MCU = Low at the heater
+    uint8_t pulseLevel = _inverted ? 0 : 1;
+    uint8_t spaceLevel = _inverted ? 1 : 0;
+
     // --- Configure TX Channel ---
     rmt_config_t tx_config = RMT_DEFAULT_CONFIG_TX(_txPin, _txChannel);
-    tx_config.clk_div = 80; // 80MHz / 80 = 1MHz tick (1 tick = 1 microsecond)
+    tx_config.clk_div = 80; // 1 tick = 1 microsecond
     rmt_config(&tx_config);
     rmt_driver_install(_txChannel, 0, 0);
 
     // --- Configure RX Channel ---
     rmt_config_t rx_config = RMT_DEFAULT_CONFIG_RX(_rxPin, _rxChannel);
-    rx_config.clk_div = 80; // 1 tick = 1 microsecond
-    // Idle threshold: if no pulses for 15ms (15000 ticks), consider transmission over
+    rx_config.clk_div = 80;
     rx_config.rx_config.idle_threshold = 15000; 
     rmt_config(&rx_config);
-    rmt_driver_install(_rxChannel, 1000, 0); // Allocate a 1000-item ring buffer
+    rmt_driver_install(_rxChannel, 1000, 0);
 
-    // Start background task to monitor RX
+    // Initial idle state for TX line
+    digitalWrite(_txPin, spaceLevel);
+
     xTaskCreate(rxTask, "RMT_RX_Task", 4096, this, 10, &_rxTaskHandle);
+    
+    Log.printf("[Driver] ESP32 RMT initialized. RX:%d TX:%d (Inverted: %s)\n", 
+               _rxPin, _txPin, _inverted ? "YES" : "NO");
 }
 
 void ESP32HeaterDriver::enableRx(bool enable) {
-    if (enable) {
-        rmt_rx_start(_rxChannel, true);
-    } else {
-        rmt_rx_stop(_rxChannel);
-    }
+    if (enable) rmt_rx_start(_rxChannel, true);
+    else rmt_rx_stop(_rxChannel);
 }
 
 // -----------------------------------------------------------------------------
@@ -55,7 +62,7 @@ bool ESP32HeaterDriver::receiveRawFrame(uint8_t* buffer) {
 
     std::memcpy(buffer, (const void*)_frames[_txPos], HEATER_FRAME_SIZE);
     _txPos = (_txPos + 1) % 5;
-
+    
     // Physical layer inversion correction
     if (buffer[0] < 0x40) {
         for (int i = 0; i < HEATER_FRAME_SIZE; i++) buffer[i] ^= 0xFF;
@@ -67,8 +74,14 @@ bool ESP32HeaterDriver::sendRawFrame(const uint8_t* buffer, unsigned int timeout
     uint8_t localFrame[HEATER_FRAME_SIZE];
     std::memcpy(localFrame, buffer, HEATER_FRAME_SIZE);
     
-    // Invert data for physical transmission
-    for (int i = 0; i < HEATER_FRAME_SIZE; i++) localFrame[i] ^= 0xFF;
+    // Physical layer inversion correction
+    if (_inverted) {
+        for (int i = 0; i < HEATER_FRAME_SIZE; i++) localFrame[i] ^= 0xFF;
+    }
+
+    // Determine levels for RMT items
+    unsigned int pL = _inverted ? 0 : 1; // Pulse level
+    unsigned int sL = _inverted ? 1 : 0; // Space level
 
     // Allocate memory for the RMT sequence. 
     // 1 start bit + (10 bytes * 8 bits) + 1 stop bit = 82 items per frame
@@ -81,20 +94,20 @@ bool ESP32HeaterDriver::sendRawFrame(const uint8_t* buffer, unsigned int timeout
     for (size_t repeat = 0; repeat < HEATER_REPEAT_SEND; repeat++) {
         size_t item_idx = 0;
 
-        // 1. Leading Pulse & Space
-        items[item_idx++] = {{{ HEATER_LEADING_PULSE, 1, HEATER_LEADING_SPACE, 0 }}};
+        // 1. Leading Pulse & Space using our dynamic levels
+        items[item_idx++] = {{{ (uint32_t)HEATER_LEADING_PULSE, pL, (uint32_t)HEATER_LEADING_SPACE, sL }}};
 
         // 2. Data payload
         for (size_t j = 0; j < HEATER_FRAME_SIZE; j++) {
             for (size_t k = 0; k < 8; k++) {
                 bool bitValue = (localFrame[j] >> k) & 1;
                 uint16_t space_len = bitValue ? HEATER_SPACE_ONE : HEATER_SPACE_ZERO;
-                items[item_idx++] = {{{ HEATER_PULSE_LENGTH, 1, space_len, 0 }}};
+                items[item_idx++] = {{{ (uint32_t)HEATER_PULSE_LENGTH, pL, (uint32_t)space_len, sL }}};
             }
         }
 
         // 3. Ending Pulse
-        items[item_idx++] = {{{ HEATER_PULSE_LENGTH, 1, 0, 0 }}};
+        items[item_idx++] = {{{ (uint32_t)HEATER_PULSE_LENGTH, pL, 0, sL }}};
 
         // Send the sequence using hardware acceleration!
         rmt_write_items(_txChannel, items, item_idx, true);
@@ -153,9 +166,11 @@ void ESP32HeaterDriver::processRmtRxItems(rmt_item32_t* item, size_t item_num) {
     uint8_t bytePos = 0;
     uint16_t bitBuffer = 1;
     
-    // Iterate over the captured hardware pulses
-    for (size_t i = 0; i < item_num; i++) {
-        uint16_t duration = item[i].duration0; // Level 0 duration (the space)
+     // Iterate over the captured hardware pulses
+   for (size_t i = 0; i < item_num; i++) {
+        // In RMT RX, duration0 is the first captured level.
+        // If inverted, the "Space" (Low) is seen as High by the MCU
+        uint16_t duration = item[i].duration0; 
         
         // Skip leading space parsing for brevity, assume data starts after sync
         if (duration > (HEATER_LEADING_SPACE - HEATER_MAX_NOISE) && 
@@ -169,7 +184,7 @@ void ESP32HeaterDriver::processRmtRxItems(rmt_item32_t* item, size_t item_num) {
         }
 
         bitBuffer = (bitBuffer << 1) | currentBit;
-        
+
         if (bitBuffer & 0b100000000) {
             _frames[_rxPos][bytePos++] = reverseBit(bitBuffer & 0xFF);
             bitBuffer = 1;

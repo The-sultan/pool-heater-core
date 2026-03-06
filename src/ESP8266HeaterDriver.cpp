@@ -8,14 +8,14 @@
 // -----------------------------------------------------------------------------
 // Constructor & Initialization
 // -----------------------------------------------------------------------------
-ESP8266HeaterDriver::ESP8266HeaterDriver(uint8_t rxPin, uint8_t txPin) 
-    : _rxPin(rxPin), _txPin(txPin), _rxPos(0), _txPos(0), _lastFrameRecvTime(0) {
+ESP8266HeaterDriver::ESP8266HeaterDriver(uint8_t rxPin, uint8_t txPin, bool inverted) 
+    : _rxPin(rxPin), _txPin(txPin), _inverted(inverted), _rxPos(0), _txPos(0), _lastFrameRecvTime(0) {
     resetDecoder();
 }
 
 void ESP8266HeaterDriver::begin() {
     pinMode(_txPin, OUTPUT);
-    digitalWrite(_txPin, HIGH); // Set default idle state on the TX line
+    digitalWrite(_txPin, _inverted ? LOW : HIGH); // Set default idle state on the TX line
     enableRx(true);
 }
 
@@ -62,9 +62,11 @@ bool ESP8266HeaterDriver::sendRawFrame(const uint8_t* buffer, unsigned int timeo
     uint8_t localFrame[HEATER_FRAME_SIZE];
     std::memcpy(localFrame, buffer, HEATER_FRAME_SIZE);
 
-    // Invert data for physical transmission over the wire
-    for(int i = 0; i < HEATER_FRAME_SIZE; i++) {
-        localFrame[i] ^= 0xFF;
+    // Only XOR if the hardware level shifter requires inversion
+    if (_inverted) {
+        for(int i = 0; i < HEATER_FRAME_SIZE; i++) {
+            localFrame[i] ^= 0xFF;
+        }
     }
 
     unsigned long startTime = millis();
@@ -83,21 +85,21 @@ bool ESP8266HeaterDriver::sendRawFrame(const uint8_t* buffer, unsigned int timeo
             for (size_t i = 0; i < HEATER_REPEAT_SEND; i++) {                            
                 
                 // Transmit leading pulse & space
-                digitalWrite(_txPin, HIGH);
+                digitalWrite(_txPin, _inverted ? LOW : HIGH);
                 delayMicroseconds(HEATER_LEADING_PULSE);
-                digitalWrite(_txPin, LOW);
+                digitalWrite(_txPin, _inverted ? HIGH : LOW);
                 delayMicroseconds(HEATER_LEADING_SPACE);
 
                 // Bit-bang the payload payload
                 for (size_t j = 0; j < HEATER_FRAME_SIZE; j++) {                    
                     for (size_t k = 0; k < 8; k++) {
-                        digitalWrite(_txPin, HIGH);
+                        digitalWrite(_txPin, _inverted ? LOW : HIGH);
                         delayMicroseconds(HEATER_PULSE_LENGTH);
 
                         // Extract the current bit (LSB first)
                         bool bitValue = (localFrame[j] >> k) & 1;
 
-                        digitalWrite(_txPin, LOW);
+                        digitalWrite(_txPin, _inverted ? HIGH : LOW);
                         delayMicroseconds(bitValue ? HEATER_SPACE_ONE : HEATER_SPACE_ZERO);
                     }                                    
                 }
@@ -132,8 +134,9 @@ void IRAM_ATTR ESP8266HeaterDriver::isrHandler(void* arg) {
     // Read the physical RX pin state
     int newPinState = digitalRead(instance->_rxPin);
     
-    // Invert the state based on the current hardware design and append to the state machine
-    instance->appendBit(!newPinState, duration);
+    // Logic swap based on hardware inversion
+    bool bitValue = instance->_inverted ? !newPinState : (bool)newPinState;
+    instance->appendBit(bitValue, duration);
     
     instance->_lastIsrTime = currentMicros;
 }

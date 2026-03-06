@@ -23,6 +23,8 @@ class ESP32HeaterDriver : public IHeaterHardware {
 private:
     gpio_num_t _rxPin;
     gpio_num_t _txPin;
+    bool _inverted; // Flag for DIY level shifter inversion
+    
     rmt_channel_t _txChannel;
     rmt_channel_t _rxChannel;
 
@@ -41,7 +43,8 @@ private:
 
 public:
     // Constructor allows pin and RMT channel assignment
-    ESP32HeaterDriver(uint8_t rxPin, uint8_t txPin, 
+    // Updated constructor with 'inverted' parameter
+    ESP32HeaterDriver(uint8_t rxPin, uint8_t txPin, bool inverted = false,
                       rmt_channel_t txChannel = RMT_CHANNEL_0, 
                       rmt_channel_t rxChannel = RMT_CHANNEL_1);
                       
