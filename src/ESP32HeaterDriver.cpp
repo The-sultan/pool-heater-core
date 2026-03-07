@@ -2,7 +2,6 @@
 #if defined(ESP32) || defined(ARDUINO_ARCH_ESP32)
 
 #include "ESP32HeaterDriver.h"
-#include "MultiLogger.h" // Use our new global Log
 #include <cstring>
 
 // -----------------------------------------------------------------------------
@@ -45,8 +44,8 @@ void ESP32HeaterDriver::begin() {
 
     xTaskCreate(rxTask, "RMT_RX_Task", 4096, this, 10, &_rxTaskHandle);
     
-    Log.printf("[Driver] ESP32 RMT initialized. RX:%d TX:%d (Inverted: %s)\n", 
-               _rxPin, _txPin, _inverted ? "YES" : "NO");
+    //Log.printf("[Driver] ESP32 RMT initialized. RX:%d TX:%d (Inverted: %s)\n", 
+    //           _rxPin, _txPin, _inverted ? "YES" : "NO");
 }
 
 void ESP32HeaterDriver::enableRx(bool enable) {
