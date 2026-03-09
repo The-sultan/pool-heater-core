@@ -8,14 +8,25 @@
 // -----------------------------------------------------------------------------
 // Constructor & Initialization
 // -----------------------------------------------------------------------------
-ESP8266HeaterDriver::ESP8266HeaterDriver(uint8_t rxPin, uint8_t txPin, bool inverted) 
-    : _rxPin(rxPin), _txPin(txPin), _inverted(inverted), _rxPos(0), _txPos(0), _lastFrameRecvTime(0) {
+ESP8266HeaterDriver::ESP8266HeaterDriver(uint8_t txPin, uint8_t rxPin, bool openDrainTx, bool invertTx, bool invertRx) 
+    : _txPin(txPin), _rxPin(rxPin), _openDrainTx(openDrainTx), _rxPos(0), _txPos(0), _lastFrameRecvTime(0) {
+    
+    // Resolve logical levels ONCE at initialization for maximum readability
+    _txPulseLevel = invertTx ? LOW : HIGH;
+    _txSpaceLevel = invertTx ? HIGH : LOW;
+    _rxSpaceLevel = invertRx ? HIGH : LOW;
+
     resetDecoder();
 }
 
 void ESP8266HeaterDriver::begin() {
-    pinMode(_txPin, OUTPUT);
-    digitalWrite(_txPin, _inverted ? LOW : HIGH); // Set default idle state on the TX line
+    if (_openDrainTx) {
+        pinMode(_txPin, OUTPUT_OPEN_DRAIN);
+    } else {
+        pinMode(_txPin, OUTPUT);
+    }
+    
+    digitalWrite(_txPin, _txSpaceLevel); // Set default idle state on the TX line
     enableRx(true);
 }
 
@@ -26,7 +37,12 @@ void ESP8266HeaterDriver::enableRx(bool enable) {
         attachInterruptArg(digitalPinToInterrupt(_rxPin), isrHandler, this, CHANGE);
     } else {
         detachInterrupt(digitalPinToInterrupt(_rxPin));
-        pinMode(_txPin, OUTPUT); 
+        // Restore TX pin mode in case we are using the same pin for 1-wire
+        if (_openDrainTx) {
+            pinMode(_txPin, OUTPUT_OPEN_DRAIN);
+        } else {
+            pinMode(_txPin, OUTPUT); 
+        }
     }
     resetDecoder();
 }
@@ -35,10 +51,7 @@ void ESP8266HeaterDriver::enableRx(bool enable) {
 // Core Interface Methods
 // -----------------------------------------------------------------------------
 bool ESP8266HeaterDriver::receiveRawFrame(uint8_t* buffer) {
-    // If transmit and receive ring buffer positions match, no new data is available
-    if (_txPos == _rxPos) {
-        return false;
-    }
+    if (_txPos == _rxPos) return false;
 
     // Copy the oldest complete frame from the ring buffer
     std::memcpy(buffer, (const void*)_frames[_txPos], HEATER_FRAME_SIZE);
@@ -46,29 +59,11 @@ bool ESP8266HeaterDriver::receiveRawFrame(uint8_t* buffer) {
     // Advance the buffer tail pointer
     _txPos = (_txPos + 1) % HEATER_RX_BUFFER_SIZE;
 
-    // Physical layer inversion correction: 
-    // The protocol logic assumes inverted data if the first byte is < 0x40.
-    if (buffer[0] < 0x40) {
-        for (int i = 0; i < HEATER_FRAME_SIZE; i++) {
-            buffer[i] ^= 0xFF;
-        }
-    }
-
-    return true; // Frame successfully retrieved
+    // Note: Software byte inversion (^= 0xFF) was removed to match ESP32 logic.
+    return true; 
 }
 
 bool ESP8266HeaterDriver::sendRawFrame(const uint8_t* buffer, unsigned int timeoutMs) {
-    // Create a local copy to handle physical layer bit-inversions without mutating the source
-    uint8_t localFrame[HEATER_FRAME_SIZE];
-    std::memcpy(localFrame, buffer, HEATER_FRAME_SIZE);
-
-    // Only XOR if the hardware level shifter requires inversion
-    if (_inverted) {
-        for(int i = 0; i < HEATER_FRAME_SIZE; i++) {
-            localFrame[i] ^= 0xFF;
-        }
-    }
-
     unsigned long startTime = millis();
 
     // Try to send the frame within the allowed timeout window
@@ -79,37 +74,37 @@ bool ESP8266HeaterDriver::sendRawFrame(const uint8_t* buffer, unsigned int timeo
         if (lastRcv < 1000000 && lastRcv > 15000) {     
             
             enableRx(false); // Stop listening while transmitting
-            digitalWrite(_txPin, HIGH);
+            digitalWrite(_txPin, _txSpaceLevel); // Ensure line is idle before starting
 
             // Repeat the frame sequence for reliability (protocol requirement)
             for (size_t i = 0; i < HEATER_REPEAT_SEND; i++) {                            
                 
-                // Transmit leading pulse & space
-                digitalWrite(_txPin, _inverted ? LOW : HIGH);
+                // Transmit leading pulse & space using calculated physical levels
+                digitalWrite(_txPin, _txPulseLevel);
                 delayMicroseconds(HEATER_LEADING_PULSE);
-                digitalWrite(_txPin, _inverted ? HIGH : LOW);
+                digitalWrite(_txPin, _txSpaceLevel);
                 delayMicroseconds(HEATER_LEADING_SPACE);
 
-                // Bit-bang the payload payload
+                // Bit-bang the payload
                 for (size_t j = 0; j < HEATER_FRAME_SIZE; j++) {                    
                     for (size_t k = 0; k < 8; k++) {
-                        digitalWrite(_txPin, _inverted ? LOW : HIGH);
+                        digitalWrite(_txPin, _txPulseLevel);
                         delayMicroseconds(HEATER_PULSE_LENGTH);
 
                         // Extract the current bit (LSB first)
-                        bool bitValue = (localFrame[j] >> k) & 1;
+                        bool bitValue = (buffer[j] >> k) & 1;
 
-                        digitalWrite(_txPin, _inverted ? HIGH : LOW);
+                        digitalWrite(_txPin, _txSpaceLevel);
                         delayMicroseconds(bitValue ? HEATER_SPACE_ONE : HEATER_SPACE_ZERO);
                     }                                    
                 }
 
                 // Transmit ending pulse
-                digitalWrite(_txPin, HIGH);         
+                digitalWrite(_txPin, _txPulseLevel);         
                 delayMicroseconds(HEATER_PULSE_LENGTH);
                 
                 // Wait before sending the next repeated frame
-                digitalWrite(_txPin, LOW);
+                digitalWrite(_txPin, _txSpaceLevel);
                 delayMicroseconds(HEATER_REPEAT_DELAY_US);
             }
 
@@ -125,7 +120,6 @@ bool ESP8266HeaterDriver::sendRawFrame(const uint8_t* buffer, unsigned int timeo
 // ISR (Interrupt) & Decoding State Machine
 // -----------------------------------------------------------------------------
 void IRAM_ATTR ESP8266HeaterDriver::isrHandler(void* arg) {
-    // Cast the void pointer back to our driver instance
     ESP8266HeaterDriver* instance = static_cast<ESP8266HeaterDriver*>(arg);
     
     unsigned long currentMicros = micros();
@@ -134,8 +128,8 @@ void IRAM_ATTR ESP8266HeaterDriver::isrHandler(void* arg) {
     // Read the physical RX pin state
     int newPinState = digitalRead(instance->_rxPin);
     
-    // Logic swap based on hardware inversion
-    bool bitValue = instance->_inverted ? !newPinState : (bool)newPinState;
+    // If the pin state matches the calculated idle (space) level, the logic bit is TRUE (1)
+    bool bitValue = (newPinState == instance->_rxSpaceLevel);
     instance->appendBit(bitValue, duration);
     
     instance->_lastIsrTime = currentMicros;
@@ -151,14 +145,12 @@ uint8_t IRAM_ATTR ESP8266HeaterDriver::reverseBit(uint8_t d) {
 }
 
 void IRAM_ATTR ESP8266HeaterDriver::appendByte(uint8_t d) {
-    // Save the byte into the current frame slot
     _frames[_rxPos][_bytePos++] = d;
 
-    // If the frame is fully assembled (10 bytes)
     if (_bytePos == HEATER_FRAME_SIZE) {
         _lastFrameRecvTime = micros();
-        _rxPos = (_rxPos + 1) % HEATER_RX_BUFFER_SIZE; // Advance the ring buffer head
-        _bytePos = 0; // Reset byte index for the next frame
+        _rxPos = (_rxPos + 1) % HEATER_RX_BUFFER_SIZE; 
+        _bytePos = 0; 
     }
 }
 
@@ -169,18 +161,14 @@ void IRAM_ATTR ESP8266HeaterDriver::resetDecoder() {
 }
 
 void IRAM_ATTR ESP8266HeaterDriver::handleError(bool bit, unsigned long duration) {
-    // Reset the decoding state machine on error. 
-    // Logging is omitted here because calling print() inside an ISR causes panics.
     resetDecoder();
 }
 
 void IRAM_ATTR ESP8266HeaterDriver::appendBit(bool bit, unsigned long duration) {
-    // If duration is abnormally long, reset the decoder
     if (duration > (HEATER_LEADING_SPACE + HEATER_MAX_NOISE)) {
         resetDecoder();
     }
 
-    // Decoding state machine
     switch (_state) {
         case WAIT_LEADING_PULSE:
             if (CHECK_TIME(duration, HEATER_LEADING_PULSE) && !bit) {
@@ -217,13 +205,11 @@ void IRAM_ATTR ESP8266HeaterDriver::appendBit(bool bit, unsigned long duration) 
                 currentBit = 1;
             }
             
-            // Shift the bit into the buffer
             _bitBuffer = (_bitBuffer << 1) | currentBit;
             
-            // If we have collected 8 bits (the 9th bit is our sentinel marker)
             if (_bitBuffer & 0b100000000) {
                 appendByte(reverseBit(_bitBuffer & 0xFF));
-                _bitBuffer = 1; // Reset sentinel
+                _bitBuffer = 1; 
             }
             break;
     }

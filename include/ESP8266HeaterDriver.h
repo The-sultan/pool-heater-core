@@ -33,9 +33,14 @@ enum CaptureState {
 
 class ESP8266HeaterDriver : public IHeaterHardware {
 private:
-    uint8_t _rxPin;
     uint8_t _txPin;
-    bool _inverted;
+    uint8_t _rxPin;
+    bool _openDrainTx;
+
+    // Resolved physical levels for clean code
+    uint8_t _txPulseLevel;
+    uint8_t _txSpaceLevel;
+    uint8_t _rxSpaceLevel;
 
     // RX Ring Buffer to store decoded frames
     uint8_t _frames[HEATER_RX_BUFFER_SIZE][HEATER_FRAME_SIZE];
@@ -62,8 +67,8 @@ private:
     static void IRAM_ATTR isrHandler(void* arg);
 
 public:
-    // Constructor allows dynamic pin assignment (e.g., D7, D2)
-    ESP8266HeaterDriver(uint8_t rxPin, uint8_t txPin, bool inverted = false);
+    // Unified constructor signature matching the new ESP32 architecture
+    ESP8266HeaterDriver(uint8_t txPin, uint8_t rxPin, bool openDrainTx = false, bool invertTx = false, bool invertRx = false);
     
     // Virtual destructor is mandatory when implementing interfaces
     virtual ~ESP8266HeaterDriver() = default;

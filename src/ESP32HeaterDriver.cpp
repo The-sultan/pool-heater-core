@@ -7,9 +7,28 @@
 // -----------------------------------------------------------------------------
 // Constructor & Initialization
 // -----------------------------------------------------------------------------
-ESP32HeaterDriver::ESP32HeaterDriver(uint8_t rxPin, uint8_t txPin, bool inverted, rmt_channel_t txChannel, rmt_channel_t rxChannel)
-    : _rxPin((gpio_num_t)rxPin), _txPin((gpio_num_t)txPin), _inverted(inverted), 
-      _txChannel(txChannel), _rxChannel(rxChannel), _rxPos(0), _txPos(0), _rxTaskHandle(NULL) {
+ESP32HeaterDriver::ESP32HeaterDriver(uint8_t txPin, uint8_t rxPin, bool openDrainTx, bool invertTx, bool invertRx)
+    : _txPin((gpio_num_t)txPin), _rxPin((gpio_num_t)rxPin), _openDrainTx(openDrainTx),
+    _invertTx(invertTx), _invertRx(invertRx), _rxPos(0), _txPos(0), _rxTaskHandle(NULL) {
+    
+    // Resolve logical levels ONCE at initialization for maximum readability
+    _txPulseLevel = invertTx ? 0 : 1;
+    _txSpaceLevel = invertTx ? 1 : 0;
+    _rxSpaceLevel = invertRx ? 1 : 0;
+
+    if (_openDrainTx) {
+        pinMode(_txPin, OUTPUT_OPEN_DRAIN);
+    } else {
+        pinMode(_txPin, OUTPUT);
+    }
+
+    // Default channels assigned silently
+    _txChannel = RMT_CHANNEL_0;
+    _rxChannel = RMT_CHANNEL_2;
+
+    for (int i = 0; i < 5; i++) {
+        memset(_frames[i], 0, HEATER_FRAME_SIZE);
+    }
 }
 
 ESP32HeaterDriver::~ESP32HeaterDriver() {
@@ -21,10 +40,9 @@ ESP32HeaterDriver::~ESP32HeaterDriver() {
 }
 
 void ESP32HeaterDriver::begin() {
-    // Determine the high/low levels based on hardware inversion
+    // Determine the high/low levels based on TX hardware inversion
     // If inverted (DIY transistors), a High from MCU = Low at the heater
-    uint8_t pulseLevel = _inverted ? 0 : 1;
-    uint8_t spaceLevel = _inverted ? 1 : 0;
+    uint8_t txSpaceLevel = _invertTx ? 1 : 0;
 
     // --- Configure TX Channel ---
     rmt_config_t tx_config = RMT_DEFAULT_CONFIG_TX(_txPin, _txChannel);
@@ -40,12 +58,9 @@ void ESP32HeaterDriver::begin() {
     rmt_driver_install(_rxChannel, 1000, 0);
 
     // Initial idle state for TX line
-    digitalWrite(_txPin, spaceLevel);
+    digitalWrite(_txPin, txSpaceLevel);
 
     xTaskCreate(rxTask, "RMT_RX_Task", 4096, this, 10, &_rxTaskHandle);
-    
-    //Log.printf("[Driver] ESP32 RMT initialized. RX:%d TX:%d (Inverted: %s)\n", 
-    //           _rxPin, _txPin, _inverted ? "YES" : "NO");
 }
 
 void ESP32HeaterDriver::enableRx(bool enable) {
@@ -62,62 +77,45 @@ bool ESP32HeaterDriver::receiveRawFrame(uint8_t* buffer) {
     std::memcpy(buffer, (const void*)_frames[_txPos], HEATER_FRAME_SIZE);
     _txPos = (_txPos + 1) % 5;
     
-    // Physical layer inversion correction
-    if (buffer[0] < 0x40) {
-        for (int i = 0; i < HEATER_FRAME_SIZE; i++) buffer[i] ^= 0xFF;
-    }
+    // Note: Software byte inversion (^= 0xFF) was removed.
+    // Inversion is now handled purely at the physical RMT level.
     return true;
 }
 
+// -----------------------------------------------------------------------------
+// Transmit Logic (Super Clean)
+// -----------------------------------------------------------------------------
 bool ESP32HeaterDriver::sendRawFrame(const uint8_t* buffer, unsigned int timeoutMs) {
-    uint8_t localFrame[HEATER_FRAME_SIZE];
-    std::memcpy(localFrame, buffer, HEATER_FRAME_SIZE);
-    
-    // Physical layer inversion correction
-    if (_inverted) {
-        for (int i = 0; i < HEATER_FRAME_SIZE; i++) localFrame[i] ^= 0xFF;
-    }
-
-    // Determine levels for RMT items
-    unsigned int pL = _inverted ? 0 : 1; // Pulse level
-    unsigned int sL = _inverted ? 1 : 0; // Space level
-
-    // Allocate memory for the RMT sequence. 
-    // 1 start bit + (10 bytes * 8 bits) + 1 stop bit = 82 items per frame
     size_t num_items = 1 + (HEATER_FRAME_SIZE * 8) + 1;
     rmt_item32_t* items = (rmt_item32_t*)malloc(sizeof(rmt_item32_t) * num_items);
     if (!items) return false;
 
-    enableRx(false); // Stop listening during TX
-
     for (size_t repeat = 0; repeat < HEATER_REPEAT_SEND; repeat++) {
         size_t item_idx = 0;
 
-        // 1. Leading Pulse & Space using our dynamic levels
-        items[item_idx++] = {{{ (uint32_t)HEATER_LEADING_PULSE, pL, (uint32_t)HEATER_LEADING_SPACE, sL }}};
+        // 1. Leading Pulse & Space using our class variables directly!
+        items[item_idx++] = {{{ (uint32_t)HEATER_LEADING_PULSE, _txPulseLevel, (uint32_t)HEATER_LEADING_SPACE, _txSpaceLevel }}};
 
         // 2. Data payload
         for (size_t j = 0; j < HEATER_FRAME_SIZE; j++) {
             for (size_t k = 0; k < 8; k++) {
-                bool bitValue = (localFrame[j] >> k) & 1;
+                bool bitValue = (buffer[j] >> k) & 1;
                 uint16_t space_len = bitValue ? HEATER_SPACE_ONE : HEATER_SPACE_ZERO;
-                items[item_idx++] = {{{ (uint32_t)HEATER_PULSE_LENGTH, pL, (uint32_t)space_len, sL }}};
+                
+                // Beautiful and readable injection
+                items[item_idx++] = {{{ (uint32_t)HEATER_PULSE_LENGTH, _txPulseLevel, (uint32_t)space_len, _txSpaceLevel }}};
             }
         }
 
         // 3. Ending Pulse
-        items[item_idx++] = {{{ (uint32_t)HEATER_PULSE_LENGTH, pL, 0, sL }}};
+        items[item_idx++] = {{{ (uint32_t)HEATER_PULSE_LENGTH, _txPulseLevel, 0, _txSpaceLevel }}};
 
-        // Send the sequence using hardware acceleration!
         rmt_write_items(_txChannel, items, item_idx, true);
-        
-        // Wait for transmission to finish, then apply inter-frame delay
         rmt_wait_tx_done(_txChannel, pdMS_TO_TICKS(100));
         delayMicroseconds(HEATER_REPEAT_DELAY_US);
     }
 
     free(items);
-    enableRx(true);
     return true;
 }
 
@@ -159,31 +157,40 @@ uint8_t ESP32HeaterDriver::reverseBit(uint8_t d) {
 }
 
 void ESP32HeaterDriver::processRmtRxItems(rmt_item32_t* item, size_t item_num) {
-    // Basic sanity check: we need enough pulses to form a valid frame
     if (item_num < (HEATER_FRAME_SIZE * 8)) return;
 
     uint8_t bytePos = 0;
     uint16_t bitBuffer = 1;
-    
-     // Iterate over the captured hardware pulses
-   for (size_t i = 0; i < item_num; i++) {
-        // In RMT RX, duration0 is the first captured level.
-        // If inverted, the "Space" (Low) is seen as High by the MCU
-        uint16_t duration = item[i].duration0; 
+ 
+    for (size_t i = 0; i < item_num; i++) {
+        // Find the correct duration within the RMT item based on the logical space level
+        uint16_t duration;
+        if (item[i].level0 == _rxSpaceLevel) {
+            duration = item[i].duration0;
+        } else if (item[i].level1 == _rxSpaceLevel) {
+            duration = item[i].duration1;
+        } else {
+            continue; // Skip if no logical space is found (noise)
+        }
         
-        // Skip leading space parsing for brevity, assume data starts after sync
+        // Discard the massive leading space
         if (duration > (HEATER_LEADING_SPACE - HEATER_MAX_NOISE) && 
             duration < (HEATER_LEADING_SPACE + HEATER_MAX_NOISE)) {
             continue; 
         }
 
+        // Decode the bit based on physical time duration, not voltage level
         uint8_t currentBit = 0;
         if (abs((long)duration - HEATER_SPACE_ONE) < HEATER_MAX_NOISE) {
             currentBit = 1;
+        } else if (abs((long)duration - HEATER_SPACE_ZERO) < HEATER_MAX_NOISE) {
+            currentBit = 0;
+        } else {
+            continue; // Invalid duration, line noise
         }
 
         bitBuffer = (bitBuffer << 1) | currentBit;
-
+        
         if (bitBuffer & 0b100000000) {
             _frames[_rxPos][bytePos++] = reverseBit(bitBuffer & 0xFF);
             bitBuffer = 1;
@@ -191,10 +198,16 @@ void ESP32HeaterDriver::processRmtRxItems(rmt_item32_t* item, size_t item_num) {
             if (bytePos == HEATER_FRAME_SIZE) {
                 _rxPos = (_rxPos + 1) % 5;
                 bytePos = 0;
-                break; // Frame complete
+                break; // Complete frame parsed
             }
         }
     }
+}
+
+void ESP32HeaterDriver::setRmtChannels(uint8_t txChannel, uint8_t rxChannel) {
+    // Only allow changes before begin() is called (when RMT drivers are installed)
+    _txChannel = (rmt_channel_t)txChannel;
+    _rxChannel = (rmt_channel_t)rxChannel;
 }
 
 #endif // ESP32
