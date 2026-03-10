@@ -5,6 +5,7 @@ enum class HeaterMode {
     COOL,
     HEAT,
     AUTO,
+    OFF,
     UNKNOWN
 };
 

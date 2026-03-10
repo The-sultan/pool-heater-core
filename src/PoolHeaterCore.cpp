@@ -1,5 +1,6 @@
 #include "PoolHeaterCore.h"
 #include <cstring> // Required for std::memcpy, std::memset, and std::memcmp
+#include <Arduino.h>
 
 // -----------------------------------------------------------------------------
 // Constructor
@@ -60,48 +61,66 @@ HeaterState PoolHeaterCore::getState() const {
     return _currentState;
 }
 
-void PoolHeaterCore::setPower(bool on) {
-    // Internal tag 0 represents Power
-    sendControlFrame(0, on ? 1 : 0);
-}
+
 
 void PoolHeaterCore::setMode(HeaterMode mode) {
-    uint8_t modeValue = 0;
-    
-    // Map our clean enum to the heater's expected integers
-    switch (mode) {
-        case HeaterMode::AUTO: modeValue = 1; break;
-        case HeaterMode::COOL: modeValue = 2; break;
-        case HeaterMode::HEAT: modeValue = 3; break;
-        default: return; // Do nothing if mode is UNKNOWN
+    if (mode == HeaterMode::OFF) {
+        // Tag 0 is Power, Value 0 is OFF
+        sendControlFrame(0, 0);
+        
+        // Wait for the hardware to process the power down command
+        delay(500); 
+        return;
     }
-    
-    // Internal tag 1 represents Mode
+
+    // Map the HeaterMode enum to the specific integer values expected by the control frame logic
+    uint8_t modeValue = 0;
+    switch (mode) {
+        case HeaterMode::AUTO:
+            modeValue = 1;
+            break;
+        case HeaterMode::COOL:
+            modeValue = 2;
+            break;
+        case HeaterMode::HEAT:
+            modeValue = 3;
+            break;
+        default:
+            return; // Unknown mode, abort
+    }
+
+    // 1. Change the operating mode first (Tag 1 is Mode)
     sendControlFrame(1, modeValue);
+
+    // Give the hardware time to process the mode change frame
+    delay(500); 
+
+    // 2. Force the power ON, completing the abstraction for the external consumer
+    // Tag 0 is Power, Value 1 is ON
+    sendControlFrame(0, 1);
 }
 
 void PoolHeaterCore::setTargetTemperature(int temp) {
-    // Safety clamp to avoid sending out-of-bounds temperatures
-    if (temp >= 15 && temp <= 38) {
-        // Internal tag 2 represents Target Temperature
-        sendControlFrame(2, static_cast<uint8_t>(temp));
-    }
-}
-
-void PoolHeaterCore::safeChangeTemperature(int temp) {
-    // Store the current power state
-    bool wasRunning = _currentState.powerOn;
+    // Check current state internally using the cached state variable
+    bool wasOn = _currentState.powerOn;
     
-    // If the heater is on, turn it off before changing the temperature
-    if (wasRunning) {
-        setPower(false);
+    if (wasOn) {
+        // Hardware constraint: pump must be OFF to accept a new target temperature
+        sendControlFrame(0, 0); // Power OFF
+        
+        // Wait for the hardware to process the power down command
+        delay(500); 
     }
     
-    setTargetTemperature(temp);
+    // Send the new target temperature (Tag 2 is Target Temperature)
+    sendControlFrame(2, temp);
     
-    // If the heater was originally on, turn it back on
-    if (wasRunning) {
-        setPower(true);
+    if (wasOn) {
+        // Wait for the temperature command to be processed
+        delay(500); 
+        
+        // Restore the previous ON state
+        sendControlFrame(0, 1); // Power ON
     }
 }
 
@@ -186,4 +205,9 @@ void PoolHeaterCore::sendControlFrame(uint8_t tag, uint8_t value) {
 
     // Dispatch the frame to the hardware layer with a 4000ms timeout
     _hardware->sendRawFrame(sendBuffer, 4000);
+}
+
+void PoolHeaterCore::setPower(bool on) {
+    // Internal tag 0 represents Power
+    sendControlFrame(0, on ? 1 : 0);
 }

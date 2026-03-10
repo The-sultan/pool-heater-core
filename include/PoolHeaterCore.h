@@ -32,6 +32,8 @@ private:
     // (Equivalent to the old sendFrame(tag, value) function)
     void sendControlFrame(uint8_t tag, uint8_t value);
 
+    void setPower(bool on);
+
 public:
     // Constructor: Requires a valid hardware implementation
     PoolHeaterCore(IHeaterHardware* hardware);
@@ -49,7 +51,7 @@ public:
     HeaterState getState() const;
 
     // Direct commands to control the heater
-    void setPower(bool on);
+    
     void setMode(HeaterMode mode);
     void setTargetTemperature(int temp);
 
