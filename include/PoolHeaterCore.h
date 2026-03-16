@@ -20,7 +20,7 @@ private:
     // --- Low-Level Internal Functions ---
     
     // Calculates the checksum for a given frame buffer
-    int calculateChecksum(const uint8_t* buffer, int len);
+    uint8_t calculateChecksum(const uint8_t* buffer, int len);
     
     // Parses incoming temperature frames (starting with 0xdd)
     void parseTemperatureFrame(const uint8_t* frame);
@@ -33,6 +33,21 @@ private:
     void sendControlFrame(uint8_t tag, uint8_t value);
 
     void setPower(bool on);
+
+    // --- Async Sequence State Machine ---
+    enum class AsyncSequence {
+        NONE,
+        TEMP_CHANGE_WAIT_OFF,
+        TEMP_CHANGE_WAIT_SET,
+        MODE_CHANGE_WAIT_SET
+    };
+
+    AsyncSequence _currentSequence = AsyncSequence::NONE;
+    unsigned long _sequenceTimer = 0;
+    int _pendingValue = 0;
+    bool _restorePower = false;
+
+    bool _pendingStateChange = false;
 
 public:
     // Constructor: Requires a valid hardware implementation
@@ -54,8 +69,4 @@ public:
     
     void setMode(HeaterMode mode);
     void setTargetTemperature(int temp);
-
-    // Protection Macro: Safely changes the temperature by ensuring the heater 
-    // is turned off before the change, and turned back on afterwards (if it was running).
-    void safeChangeTemperature(int temp);
 };

@@ -7,14 +7,19 @@
 // -----------------------------------------------------------------------------
 // Constructor & Initialization
 // -----------------------------------------------------------------------------
-ESP32HeaterDriver::ESP32HeaterDriver(uint8_t txPin, uint8_t rxPin, bool openDrainTx, bool invertTx, bool invertRx)
-    : _txPin((gpio_num_t)txPin), _rxPin((gpio_num_t)rxPin), _openDrainTx(openDrainTx),
-    _invertTx(invertTx), _invertRx(invertRx), _rxPos(0), _txPos(0), _rxTaskHandle(NULL) {
+ESP32HeaterDriver::ESP32HeaterDriver(uint8_t rxPin, uint8_t txPin, bool openDrainTx, bool invertTx, bool invertRx)
+    : _rxPin((gpio_num_t)rxPin), _txPin((gpio_num_t)txPin), _openDrainTx(openDrainTx),
+    _invertTx(invertTx), _invertRx(invertRx), _rxPos(0), _txPos(0), 
+    _rxTaskHandle(NULL), _txTaskHandle(NULL), _txQueue(NULL) {
     
-    // Resolve logical levels ONCE at initialization for maximum readability
-    _txPulseLevel = invertTx ? 0 : 1;
-    _txSpaceLevel = invertTx ? 1 : 0;
-    _rxSpaceLevel = invertRx ? 1 : 0;
+    // CORRECTED LOGIC: For BJT (NPN) transistors, the MCU must output HIGH to turn 
+    // the transistor ON, which pulls the physical bus LOW (creating a pulse).
+    _txPulseLevel = invertTx ? 1 : 0;
+    _txSpaceLevel = invertTx ? 0 : 1;
+    
+    // If hardware is inverted, the idle state of the bus (HIGH) will turn the 
+    // RX transistor ON, pulling the MCU pin LOW.
+    _rxSpaceLevel = invertRx ? 0 : 1;
 
     if (_openDrainTx) {
         pinMode(_txPin, OUTPUT_OPEN_DRAIN);
@@ -32,18 +37,15 @@ ESP32HeaterDriver::ESP32HeaterDriver(uint8_t txPin, uint8_t rxPin, bool openDrai
 }
 
 ESP32HeaterDriver::~ESP32HeaterDriver() {
-    if (_rxTaskHandle) {
-        vTaskDelete(_rxTaskHandle);
-    }
+    if (_rxTaskHandle) vTaskDelete(_rxTaskHandle);
+    if (_txTaskHandle) vTaskDelete(_txTaskHandle);
+    if (_txQueue) vQueueDelete(_txQueue);
+    
     rmt_driver_uninstall(_txChannel);
     rmt_driver_uninstall(_rxChannel);
 }
 
 void ESP32HeaterDriver::begin() {
-    // Determine the high/low levels based on TX hardware inversion
-    // If inverted (DIY transistors), a High from MCU = Low at the heater
-    uint8_t txSpaceLevel = _invertTx ? 1 : 0;
-
     // --- Configure TX Channel ---
     rmt_config_t tx_config = RMT_DEFAULT_CONFIG_TX(_txPin, _txChannel);
     tx_config.clk_div = 80; // 1 tick = 1 microsecond
@@ -57,10 +59,15 @@ void ESP32HeaterDriver::begin() {
     rmt_config(&rx_config);
     rmt_driver_install(_rxChannel, 1000, 0);
 
-    // Initial idle state for TX line
-    digitalWrite(_txPin, txSpaceLevel);
+    // Initial idle state for TX line using resolved logical levels
+    digitalWrite(_txPin, _txSpaceLevel);
 
-    xTaskCreate(rxTask, "RMT_RX_Task", 4096, this, 10, &_rxTaskHandle);
+    // Create RTOS Queue for async transmissions (capacity for 5 frames)
+    _txQueue = xQueueCreate(5, HEATER_FRAME_SIZE);
+
+    // Launch background tasks pinned to Core 1 (default Arduino core)
+    xTaskCreatePinnedToCore(rxTask, "RMT_RX_Task", 4096, this, 10, &_rxTaskHandle, 1);
+    xTaskCreatePinnedToCore(txTask, "RMT_TX_Task", 4096, this, 9, &_txTaskHandle, 1);
 }
 
 void ESP32HeaterDriver::enableRx(bool enable) {
@@ -77,72 +84,102 @@ bool ESP32HeaterDriver::receiveRawFrame(uint8_t* buffer) {
     std::memcpy(buffer, (const void*)_frames[_txPos], HEATER_FRAME_SIZE);
     _txPos = (_txPos + 1) % 5;
     
-    // Note: Software byte inversion (^= 0xFF) was removed.
-    // Inversion is now handled purely at the physical RMT level.
     return true;
 }
 
 // -----------------------------------------------------------------------------
-// Transmit Logic (Super Clean)
+// Non-Blocking Transmit (Delegates to FreeRTOS Task)
 // -----------------------------------------------------------------------------
 bool ESP32HeaterDriver::sendRawFrame(const uint8_t* buffer, unsigned int timeoutMs) {
-    size_t num_items = 1 + (HEATER_FRAME_SIZE * 8) + 1;
-    rmt_item32_t* items = (rmt_item32_t*)malloc(sizeof(rmt_item32_t) * num_items);
-    if (!items) return false;
-
-    for (size_t repeat = 0; repeat < HEATER_REPEAT_SEND; repeat++) {
-        size_t item_idx = 0;
-
-        // 1. Leading Pulse & Space using our class variables directly!
-        items[item_idx++] = {{{ (uint32_t)HEATER_LEADING_PULSE, _txPulseLevel, (uint32_t)HEATER_LEADING_SPACE, _txSpaceLevel }}};
-
-        // 2. Data payload
-        for (size_t j = 0; j < HEATER_FRAME_SIZE; j++) {
-            for (size_t k = 0; k < 8; k++) {
-                bool bitValue = (buffer[j] >> k) & 1;
-                uint16_t space_len = bitValue ? HEATER_SPACE_ONE : HEATER_SPACE_ZERO;
-                
-                // Beautiful and readable injection
-                items[item_idx++] = {{{ (uint32_t)HEATER_PULSE_LENGTH, _txPulseLevel, (uint32_t)space_len, _txSpaceLevel }}};
-            }
-        }
-
-        // 3. Ending Pulse
-        items[item_idx++] = {{{ (uint32_t)HEATER_PULSE_LENGTH, _txPulseLevel, 0, _txSpaceLevel }}};
-
-        rmt_write_items(_txChannel, items, item_idx, true);
-        rmt_wait_tx_done(_txChannel, pdMS_TO_TICKS(100));
-        delayMicroseconds(HEATER_REPEAT_DELAY_US);
+    if (!_txQueue) return false;
+    
+    // Instantly pushes the payload to the RTOS queue and returns control to main loop
+    if (xQueueSend(_txQueue, buffer, pdMS_TO_TICKS(timeoutMs)) == pdPASS) {
+        log_i("DEBUG_TX: Frame queued for async transmission.");
+        return true;
     }
-
-    free(items);
-    return true;
+    
+    log_e("ERROR_TX: TX Queue is full, frame dropped.");
+    return false;
 }
 
 // -----------------------------------------------------------------------------
-// RX Task & Decoding
+// Background TX Task (Handles repeats and delays without blocking main loop)
+// -----------------------------------------------------------------------------
+void ESP32HeaterDriver::txTask(void* arg) {
+    ESP32HeaterDriver* instance = static_cast<ESP32HeaterDriver*>(arg);
+    uint8_t buffer[HEATER_FRAME_SIZE];
+
+    // Pre-allocate memory for RMT items to avoid heap fragmentation
+    size_t num_items = 1 + (HEATER_FRAME_SIZE * 8) + 1;
+    rmt_item32_t* items = (rmt_item32_t*)malloc(sizeof(rmt_item32_t) * num_items);
+
+    while (true) {
+        // Block indefinitely until a frame arrives in the queue
+        if (xQueueReceive(instance->_txQueue, &buffer, portMAX_DELAY) == pdTRUE) {
+            
+            // Temporarily disable RX so we don't read our own transmission
+            instance->enableRx(false);
+
+            for (size_t repeat = 0; repeat < HEATER_REPEAT_SEND; repeat++) {
+                size_t item_idx = 0;
+
+                // 1. Leading Pulse & Space
+                items[item_idx++] = {{{ (uint32_t)HEATER_LEADING_PULSE, instance->_txPulseLevel, 
+                                        (uint32_t)HEATER_LEADING_SPACE, instance->_txSpaceLevel }}};
+
+                // 2. Data payload
+                for (size_t j = 0; j < HEATER_FRAME_SIZE; j++) {
+                    for (size_t k = 0; k < 8; k++) {
+                        bool bitValue = (buffer[j] >> k) & 1;
+                        uint16_t space_len = bitValue ? HEATER_SPACE_ONE : HEATER_SPACE_ZERO;
+                        
+                        items[item_idx++] = {{{ (uint32_t)HEATER_PULSE_LENGTH, instance->_txPulseLevel, 
+                                                (uint32_t)space_len, instance->_txSpaceLevel }}};
+                    }
+                }
+
+                // 3. Ending Pulse (Add a minor 1000us space to terminate correctly in RMT)
+                items[item_idx++] = {{{ (uint32_t)HEATER_PULSE_LENGTH, instance->_txPulseLevel, 
+                                        1000, instance->_txSpaceLevel }}};
+
+                // Push items to RMT hardware
+                rmt_write_items(instance->_txChannel, items, item_idx, true);
+                rmt_wait_tx_done(instance->_txChannel, pdMS_TO_TICKS(100));
+                
+                // FreeRTOS delay: yields processing time back to Wi-Fi/ESPHome 
+                vTaskDelay(pdMS_TO_TICKS(HEATER_REPEAT_DELAY_MS));
+            }
+
+            // Restore RX listening
+            instance->enableRx(true);
+            log_i("DEBUG_TX: Async transmission complete.");
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Background RX Task & Decoding
 // -----------------------------------------------------------------------------
 void ESP32HeaterDriver::rxTask(void* arg) {
     ESP32HeaterDriver* instance = static_cast<ESP32HeaterDriver*>(arg);
     RingbufHandle_t rb = NULL;
     
-    // Get the internal FreeRTOS ringbuffer from the RMT driver
     rmt_get_ringbuf_handle(instance->_rxChannel, &rb);
 
     while (true) {
         if (rb) {
             size_t rx_size = 0;
-            // Block and wait until the RMT hardware detects an idle line (frame received)
+            // Block and wait until the RMT hardware detects an idle line
             rmt_item32_t* item = (rmt_item32_t*)xRingbufferReceive(rb, &rx_size, portMAX_DELAY);
             
             if (item) {
                 size_t item_num = rx_size / sizeof(rmt_item32_t);
                 instance->processRmtRxItems(item, item_num);
-                // Return the memory block to the ringbuffer
                 vRingbufferReturnItem(rb, (void*)item);
             }
         } else {
-            vTaskDelay(pdMS_TO_TICKS(100)); // Fallback delay
+            vTaskDelay(pdMS_TO_TICKS(100)); // Fallback delay if ringbuffer isn't ready
         }
     }
 }
@@ -163,14 +200,15 @@ void ESP32HeaterDriver::processRmtRxItems(rmt_item32_t* item, size_t item_num) {
     uint16_t bitBuffer = 1;
  
     for (size_t i = 0; i < item_num; i++) {
-        // Find the correct duration within the RMT item based on the logical space level
         uint16_t duration;
+        
+        // Find the correct duration based on the logical space level
         if (item[i].level0 == _rxSpaceLevel) {
             duration = item[i].duration0;
         } else if (item[i].level1 == _rxSpaceLevel) {
             duration = item[i].duration1;
         } else {
-            continue; // Skip if no logical space is found (noise)
+            continue; // Skip noise
         }
         
         // Discard the massive leading space
@@ -179,14 +217,14 @@ void ESP32HeaterDriver::processRmtRxItems(rmt_item32_t* item, size_t item_num) {
             continue; 
         }
 
-        // Decode the bit based on physical time duration, not voltage level
+        // Decode the bit based on physical time duration
         uint8_t currentBit = 0;
         if (abs((long)duration - HEATER_SPACE_ONE) < HEATER_MAX_NOISE) {
             currentBit = 1;
         } else if (abs((long)duration - HEATER_SPACE_ZERO) < HEATER_MAX_NOISE) {
             currentBit = 0;
         } else {
-            continue; // Invalid duration, line noise
+            continue; // Invalid duration
         }
 
         bitBuffer = (bitBuffer << 1) | currentBit;
@@ -198,14 +236,13 @@ void ESP32HeaterDriver::processRmtRxItems(rmt_item32_t* item, size_t item_num) {
             if (bytePos == HEATER_FRAME_SIZE) {
                 _rxPos = (_rxPos + 1) % 5;
                 bytePos = 0;
-                break; // Complete frame parsed
+                break; // Complete frame parsed successfully
             }
         }
     }
 }
 
 void ESP32HeaterDriver::setRmtChannels(uint8_t txChannel, uint8_t rxChannel) {
-    // Only allow changes before begin() is called (when RMT drivers are installed)
     _txChannel = (rmt_channel_t)txChannel;
     _rxChannel = (rmt_channel_t)rxChannel;
 }

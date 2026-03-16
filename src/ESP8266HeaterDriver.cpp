@@ -11,10 +11,14 @@
 ESP8266HeaterDriver::ESP8266HeaterDriver(uint8_t txPin, uint8_t rxPin, bool openDrainTx, bool invertTx, bool invertRx) 
     : _txPin(txPin), _rxPin(rxPin), _openDrainTx(openDrainTx), _rxPos(0), _txPos(0), _lastFrameRecvTime(0) {
     
-    // Resolve logical levels ONCE at initialization for maximum readability
-    _txPulseLevel = invertTx ? LOW : HIGH;
-    _txSpaceLevel = invertTx ? HIGH : LOW;
-    _rxSpaceLevel = invertRx ? HIGH : LOW;
+   // CORRECCIÓN: Si está invertido por hardware (BJT), 
+    // el ESP manda HIGH para el pulso y LOW para el espacio.
+    _txPulseLevel = invertTx ? HIGH : LOW;
+    _txSpaceLevel = invertTx ? LOW : HIGH;
+    
+    // CORRECCIÓN: Si el hardware RX invierte (BJT), 
+    // el estado de reposo (bus HIGH) se lee como LOW en el ESP.
+    _rxSpaceLevel = invertRx ? LOW : HIGH;
 
     resetDecoder();
 }
@@ -47,9 +51,6 @@ void ESP8266HeaterDriver::enableRx(bool enable) {
     resetDecoder();
 }
 
-// -----------------------------------------------------------------------------
-// Core Interface Methods
-// -----------------------------------------------------------------------------
 bool ESP8266HeaterDriver::receiveRawFrame(uint8_t* buffer) {
     if (_txPos == _rxPos) return false;
 
@@ -59,60 +60,84 @@ bool ESP8266HeaterDriver::receiveRawFrame(uint8_t* buffer) {
     // Advance the buffer tail pointer
     _txPos = (_txPos + 1) % HEATER_RX_BUFFER_SIZE;
 
-    // Note: Software byte inversion (^= 0xFF) was removed to match ESP32 logic.
     return true; 
 }
 
 bool ESP8266HeaterDriver::sendRawFrame(const uint8_t* buffer, unsigned int timeoutMs) {
     unsigned long startTime = millis();
+    Serial.printf("[Driver] Attempting to TX frame. Timeout: %dms\n", timeoutMs);
 
     // Try to send the frame within the allowed timeout window
     while ((millis() - startTime) < timeoutMs) {
         unsigned long lastRcv = micros() - _lastFrameRecvTime; 
         
-        // Wait for a quiet window on the bus (between 15ms and 1000ms since last receive)
-        if (lastRcv < 1000000 && lastRcv > 15000) {     
-            
+        // Relaxed upper bound constraint. As long as it is > 15ms silent, send it.
+        if (lastRcv > 15000) {     
             enableRx(false); // Stop listening while transmitting
             digitalWrite(_txPin, _txSpaceLevel); // Ensure line is idle before starting
+            
+            Serial.printf("[Driver] Silence window found (%lu us). Sending pulses...\n", lastRcv);
 
             // Repeat the frame sequence for reliability (protocol requirement)
             for (size_t i = 0; i < HEATER_REPEAT_SEND; i++) {                            
                 
-                // Transmit leading pulse & space using calculated physical levels
+                // --- SHIELD ON: Block Wi-Fi interrupts for precise timing ---
+                noInterrupts(); 
+
+                // Transmit leading pulse & space
                 digitalWrite(_txPin, _txPulseLevel);
                 delayMicroseconds(HEATER_LEADING_PULSE);
                 digitalWrite(_txPin, _txSpaceLevel);
                 delayMicroseconds(HEATER_LEADING_SPACE);
 
+                // --- SHIELD OFF: Let ESP process Wi-Fi momentarily ---
+                interrupts(); 
+
                 // Bit-bang the payload
                 for (size_t j = 0; j < HEATER_FRAME_SIZE; j++) {                    
                     for (size_t k = 0; k < 8; k++) {
+                        
+                        // CRITICAL PROTOCOL FIX: The pump expects inverted durations natively.
+                        // We must logically invert the bit to map it to the correct space length.
+                        bool bitValue = !((buffer[j] >> k) & 1); 
+
+                        // --- SHIELD ON ---
+                        noInterrupts();
+                        
                         digitalWrite(_txPin, _txPulseLevel);
                         delayMicroseconds(HEATER_PULSE_LENGTH);
 
-                        // Extract the current bit (LSB first)
-                        bool bitValue = (buffer[j] >> k) & 1;
-
                         digitalWrite(_txPin, _txSpaceLevel);
                         delayMicroseconds(bitValue ? HEATER_SPACE_ONE : HEATER_SPACE_ZERO);
+                        
+                        // --- SHIELD OFF ---
+                        interrupts(); 
                     }                                    
                 }
 
+                // --- SHIELD ON ---
+                noInterrupts();
+                
                 // Transmit ending pulse
                 digitalWrite(_txPin, _txPulseLevel);         
                 delayMicroseconds(HEATER_PULSE_LENGTH);
-                
-                // Wait before sending the next repeated frame
                 digitalWrite(_txPin, _txSpaceLevel);
-                delayMicroseconds(HEATER_REPEAT_DELAY_US);
+                
+                // --- SHIELD OFF ---
+                interrupts();
+
+                // Wait before sending the next repeated frame
+                delay(HEATER_REPEAT_DELAY_US / 1000); 
             }
 
             enableRx(true); // Resume listening
+            Serial.println("[Driver] TX completed successfully.");
             return true;
         }
-        delay(1); // Yield to the hardware watchdog to prevent crashes
+        delay(1); // Yield to the hardware watchdog
     }
+    
+    Serial.println("[Driver] ERROR: TX timeout. No silence window found on the bus.");
     return false; // Timed out waiting for a clear bus
 }
 

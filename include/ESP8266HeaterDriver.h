@@ -15,7 +15,7 @@
 #define HEATER_PULSE_LENGTH       1152
 #define HEATER_SPACE_ONE          1141
 #define HEATER_SPACE_ZERO         3180
-#define HEATER_MAX_NOISE          500
+#define HEATER_MAX_NOISE          1000
 
 #define HEATER_FRAME_SIZE         10
 #define HEATER_RX_BUFFER_SIZE     5

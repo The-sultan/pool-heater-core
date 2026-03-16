@@ -6,16 +6,19 @@
 
 #include <Arduino.h>
 #include "IHeaterHardware.h"
-#include <driver/rmt.h> // Native ESP-IDF RMT driver
+#include <driver/rmt.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/queue.h>
 
-// Hardware timing constants (same as ESP8266)
+// Hardware timing constants
 #define HEATER_LEADING_PULSE      9300
 #define HEATER_LEADING_SPACE      4700
 #define HEATER_PULSE_LENGTH       1152
 #define HEATER_SPACE_ONE          1141
 #define HEATER_SPACE_ZERO         3180
 #define HEATER_REPEAT_SEND        3
-#define HEATER_REPEAT_DELAY_US    243000
+#define HEATER_REPEAT_DELAY_MS    243 // Converted to milliseconds for RTOS
 #define HEATER_MAX_NOISE          500
 #define HEATER_FRAME_SIZE         10
 
@@ -24,8 +27,7 @@ private:
     gpio_num_t _rxPin;
     gpio_num_t _txPin;
 
-    bool _openDrainTx; // Flag for physical bus topology
-
+    bool _openDrainTx;
     bool _invertTx;
     bool _invertRx;
 
@@ -42,17 +44,20 @@ private:
     volatile int _rxPos;
     volatile int _txPos;
 
-    // Internal helper to convert raw timings from the RMT peripheral into bytes
+    // FreeRTOS Handlers for true non-blocking async architecture
+    TaskHandle_t _rxTaskHandle;
+    TaskHandle_t _txTaskHandle;
+    QueueHandle_t _txQueue;
+
+    // Internal helpers
     void processRmtRxItems(rmt_item32_t* item, size_t item_num);
     static uint8_t reverseBit(uint8_t d);
 
-    // FreeRTOS Task handle for the RX monitoring loop
-    TaskHandle_t _rxTaskHandle;
-    static void rxTask(void* arg); // Runs in the background waiting for RMT data
+    // FreeRTOS Background Tasks
+    static void rxTask(void* arg); 
+    static void txTask(void* arg); 
 
 public:
-    // Constructor allows pin and RMT channel assignment
-    // Updated constructor with 'inverted' parameter
     ESP32HeaterDriver(uint8_t rxPin, uint8_t txPin, bool openDrainTx = false, 
                       bool invertTx = false, bool invertRx = false);
 
@@ -82,6 +87,8 @@ public:
     void begin() override;
     void enableRx(bool enable) override;
     bool receiveRawFrame(uint8_t* buffer) override;
+    
+    // This is now 100% non-blocking. It pushes to a FreeRTOS queue.
     bool sendRawFrame(const uint8_t* buffer, unsigned int timeoutMs) override;
 };
 
