@@ -67,7 +67,21 @@ private:
     static void IRAM_ATTR isrHandler(void* arg);
 
 public:
-    // Unified constructor signature matching the new ESP32 architecture
+    /**
+     * @param txPin       GPIO used to transmit.
+     * @param rxPin       GPIO used to receive.
+     * @param openDrainTx Drive TX as open-drain (only pulls low).
+     * @param invertTx    true if the TX front end inverts the signal (e.g. 2N2222).
+     * @param invertRx    true if the RX front end inverts the signal (e.g. 2N2222).
+     *
+     * For a non-inverting front end (e.g. BSS138 level shifter) use
+     * invertTx = false and invertRx = false. The flags have the same meaning as
+     * in ESP32HeaterDriver. Note: the argument order is (txPin, rxPin), while the
+     * ESP32 driver takes (rxPin, txPin).
+     *
+     * Breaking change in 2.0.0: invertRx used to have the opposite meaning on
+     * this driver (a BSS138 needed invertRx = true). Flip it when upgrading.
+     */
     ESP8266HeaterDriver(uint8_t txPin, uint8_t rxPin, bool openDrainTx = false, bool invertTx = false, bool invertRx = false);
     
     // Virtual destructor is mandatory when implementing interfaces
