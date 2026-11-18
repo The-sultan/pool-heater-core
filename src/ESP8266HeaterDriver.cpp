@@ -11,13 +11,22 @@
 ESP8266HeaterDriver::ESP8266HeaterDriver(uint8_t txPin, uint8_t rxPin, bool openDrainTx, bool invertTx, bool invertRx) 
     : _txPin(txPin), _rxPin(rxPin), _openDrainTx(openDrainTx), _rxPos(0), _txPos(0), _lastFrameRecvTime(0) {
     
-   // CORRECCIÓN: Si está invertido por hardware (BJT), 
-    // el ESP manda HIGH para el pulso y LOW para el espacio.
+    // Polarity flags describe the hardware front end, with the same meaning as
+    // in ESP32HeaterDriver:
+    //   invertTx = true  -> the TX front end inverts the signal (e.g. 2N2222 stage).
+    //   invertRx = true  -> the RX front end inverts the signal (e.g. 2N2222 stage).
+    //   false / false    -> non-inverting front end (e.g. BSS138 level shifter).
+    //
+    // On the bus a pulse is LOW and a space (and idle) is HIGH. These are the
+    // levels the ESP must drive / will read on its own pins.
+
+    // TX: a non-inverting front end needs LOW for a pulse and HIGH for a space;
+    // an inverting one needs the opposite.
     _txPulseLevel = invertTx ? HIGH : LOW;
     _txSpaceLevel = invertTx ? LOW : HIGH;
-    
-    // CORRECCIÓN: Si el hardware RX invierte (BJT), 
-    // el estado de reposo (bus HIGH) se lee como LOW en el ESP.
+
+    // RX: a bus space (HIGH) is read as HIGH through a non-inverting front end
+    // and as LOW through an inverting one.
     _rxSpaceLevel = invertRx ? LOW : HIGH;
 
     resetDecoder();
@@ -150,12 +159,38 @@ void IRAM_ATTR ESP8266HeaterDriver::isrHandler(void* arg) {
     unsigned long currentMicros = micros();
     unsigned long duration = currentMicros - instance->_lastIsrTime;
     
-    // Read the physical RX pin state
+    // This ISR fires on every edge (CHANGE). 'duration' is the length of the
+    // segment that just ENDED, but digitalRead() returns the level AFTER the
+    // edge, i.e. the level of the segment that is just STARTING. The level of
+    // the segment that ended is therefore the opposite of the current pin level.
     int newPinState = digitalRead(instance->_rxPin);
-    
-    // If the pin state matches the calculated idle (space) level, the logic bit is TRUE (1)
-    bool bitValue = (newPinState == instance->_rxSpaceLevel);
-    instance->appendBit(bitValue, duration);
+    int endedLevel = (newPinState == HIGH) ? LOW : HIGH;
+
+    // 'isSpace' tells appendBit() whether the segment of length 'duration'
+    // was a bus space (HIGH on the bus) or a pulse (LOW on the bus).
+    //
+    // Walk-through for a non-inverting front end (invertRx = false, so
+    // _rxSpaceLevel = HIGH; pin level == bus level):
+    //   - Leading pulse (9.3 ms LOW) ends: pin goes HIGH, endedLevel = LOW
+    //     -> isSpace = false. WAIT_LEADING_PULSE expects duration ~9300 && !bit
+    //     -> advance to WAIT_LEADING_SPACE.
+    //   - Leading space (4.7 ms HIGH) ends: pin goes LOW, endedLevel = HIGH
+    //     -> isSpace = true. WAIT_LEADING_SPACE expects duration ~4700 && bit
+    //     -> advance to WAIT_PULSE.
+    //   - Bit pulse (~1.15 ms LOW) ends: endedLevel = LOW -> isSpace = false.
+    //     WAIT_PULSE expects duration ~1152 && !bit -> advance to WAIT_BIT.
+    //   - Bit space (1.14 ms = 1, 3.18 ms = 0, HIGH) ends: endedLevel = HIGH
+    //     -> isSpace = true. WAIT_BIT expects bit, decodes the value from
+    //     duration and returns to WAIT_PULSE.
+    // With an inverting front end (invertRx = true) both the pin level and
+    // _rxSpaceLevel are flipped, so isSpace is identical in every step.
+    //
+    // Note: this is exactly equivalent to the pre-2.0.0 code, which compared
+    // newPinState directly, with the flag flipped (old invertRx = true is
+    // new invertRx = false). The flag now means "the front end inverts the
+    // signal", matching ESP32HeaterDriver.
+    bool isSpace = (endedLevel == instance->_rxSpaceLevel);
+    instance->appendBit(isSpace, duration);
     
     instance->_lastIsrTime = currentMicros;
 }

@@ -1,6 +1,6 @@
 {
   "name": "pool-heater-core",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Abstract decouple library for controling heat pumps with the CC120A-U6.3 board",
   "keywords": [
     "pool",

@@ -7,18 +7,28 @@
 // -----------------------------------------------------------------------------
 // Constructor & Initialization
 // -----------------------------------------------------------------------------
-ESP32HeaterDriver::ESP32HeaterDriver(uint8_t rxPin, uint8_t txPin, bool openDrainTx, bool invertTx, bool invertRx)
-    : _rxPin((gpio_num_t)rxPin), _txPin((gpio_num_t)txPin), _openDrainTx(openDrainTx),
+ESP32HeaterDriver::ESP32HeaterDriver(uint8_t txPin, uint8_t rxPin, bool openDrainTx, bool invertTx, bool invertRx)
+    : _txPin((gpio_num_t)txPin), _rxPin((gpio_num_t)rxPin), _openDrainTx(openDrainTx),
     _invertTx(invertTx), _invertRx(invertRx), _rxPos(0), _txPos(0), 
     _rxTaskHandle(NULL), _txTaskHandle(NULL), _txQueue(NULL) {
     
-    // CORRECTED LOGIC: For BJT (NPN) transistors, the MCU must output HIGH to turn 
-    // the transistor ON, which pulls the physical bus LOW (creating a pulse).
+    // Polarity flags describe the hardware front end, with the same meaning as
+    // in ESP8266HeaterDriver:
+    //   invertTx = true  -> the TX front end inverts the signal (e.g. 2N2222 stage).
+    //   invertRx = true  -> the RX front end inverts the signal (e.g. 2N2222 stage).
+    //   false / false    -> non-inverting front end (e.g. BSS138 level shifter).
+    //
+    // On the bus a pulse is LOW and a space (and idle) is HIGH. These are the
+    // levels the ESP must drive / will read on its own pins.
+
+    // TX: a non-inverting front end needs LOW for a pulse and HIGH for a space;
+    // an inverting one needs the opposite.
     _txPulseLevel = invertTx ? 1 : 0;
     _txSpaceLevel = invertTx ? 0 : 1;
-    
-    // If hardware is inverted, the idle state of the bus (HIGH) will turn the 
-    // RX transistor ON, pulling the MCU pin LOW.
+
+    // RX: RMT items carry the level DURING each segment. A bus space (HIGH) is
+    // read as HIGH through a non-inverting front end and as LOW through an
+    // inverting one.
     _rxSpaceLevel = invertRx ? 0 : 1;
 
     if (_openDrainTx) {
