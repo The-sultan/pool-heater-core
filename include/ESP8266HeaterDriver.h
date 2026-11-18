@@ -75,9 +75,8 @@ public:
      * @param invertRx    true if the RX front end inverts the signal (e.g. 2N2222).
      *
      * For a non-inverting front end (e.g. BSS138 level shifter) use
-     * invertTx = false and invertRx = false. The flags have the same meaning as
-     * in ESP32HeaterDriver. Note: the argument order is (txPin, rxPin), while the
-     * ESP32 driver takes (rxPin, txPin).
+     * invertTx = false and invertRx = false. Same signature and flag semantics
+     * as ESP32HeaterDriver.
      *
      * Breaking change in 2.0.0: invertRx used to have the opposite meaning on
      * this driver (a BSS138 needed invertRx = true). Flip it when upgrading.

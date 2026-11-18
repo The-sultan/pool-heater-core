@@ -24,8 +24,8 @@
 
 class ESP32HeaterDriver : public IHeaterHardware {
 private:
-    gpio_num_t _rxPin;
     gpio_num_t _txPin;
+    gpio_num_t _rxPin;
 
     bool _openDrainTx;
     bool _invertTx;
@@ -58,7 +58,22 @@ private:
     static void txTask(void* arg); 
 
 public:
-    ESP32HeaterDriver(uint8_t rxPin, uint8_t txPin, bool openDrainTx = false, 
+    /**
+     * @param txPin       GPIO used to transmit.
+     * @param rxPin       GPIO used to receive.
+     * @param openDrainTx Drive TX as open-drain (only pulls low).
+     * @param invertTx    true if the TX front end inverts the signal (e.g. 2N2222).
+     * @param invertRx    true if the RX front end inverts the signal (e.g. 2N2222).
+     *
+     * For a non-inverting front end (e.g. BSS138 level shifter) use
+     * invertTx = false and invertRx = false. Same signature and flag semantics
+     * as ESP8266HeaterDriver.
+     *
+     * Breaking change in 2.0.0: the pin arguments used to be (rxPin, txPin).
+     * They are now (txPin, rxPin). Both are uint8_t, so old call sites still
+     * compile but get their pins swapped: update them when upgrading.
+     */
+    ESP32HeaterDriver(uint8_t txPin, uint8_t rxPin, bool openDrainTx = false,
                       bool invertTx = false, bool invertRx = false);
 
     /**
